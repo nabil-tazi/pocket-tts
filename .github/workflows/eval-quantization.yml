@@ -1,0 +1,69 @@
+name: Quantization Benchmark
+
+on:
+  push:
+    branches: [ci/quantization-benchmark]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Install uv
+      uses: astral-sh/setup-uv@v7
+    - name: Install dependencies
+      run: uv sync
+    - name: Run 10x isolated RTS benchmark (all configs, outlier removal)
+      run: |
+        uv run python -c "
+        from pocket_tts import TTSModel
+        from pocket_tts.quantization import CONFIGS, apply_dynamic_int8, get_model_size_mb
+        import time, statistics
+
+        TEXT = ('Sarah had always wondered whether the old lighthouse still worked. '
+               'On clear mornings, she would walk the narrow coastal path past the fishing boats, '
+               'the salt-weathered fences, the occasional curious gull and stop at the cliffs edge to look.')
+
+        RUNS = 10
+
+        def remove_outliers(vals):
+            if len(vals) < 4:
+                return vals
+            s = sorted(vals)
+            q1, q3 = s[len(s) // 4], s[3 * len(s) // 4]
+            iqr = q3 - q1
+            lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            return [v for v in vals if lo <= v <= hi]
+
+        results = []
+        for config_id, groups in CONFIGS.items():
+            model = TTSModel.load_model()
+            if groups:
+                apply_dynamic_int8(model.flow_lm, groups)
+            size = get_model_size_mb(model.flow_lm)
+            state = model.get_state_for_audio_prompt('alba')
+            model.generate_audio(state, 'Hello.')
+            model.generate_audio(state, TEXT)
+
+            rts_vals = []
+            for i in range(RUNS):
+                t0 = time.perf_counter()
+                audio = model.generate_audio(state, TEXT)
+                wall = time.perf_counter() - t0
+                rts_vals.append((len(audio) / model.sample_rate) / wall)
+
+            filtered = remove_outliers(rts_vals)
+            avg = statistics.mean(filtered)
+            sd = statistics.stdev(filtered) if len(filtered) > 1 else 0
+            results.append((config_id, size, avg, sd, len(filtered), rts_vals))
+            del model
+
+        print()
+        print('=' * 90)
+        print('x86 FBGEMM BENCHMARK (10 runs, outliers removed)')
+        print('=' * 90)
+        print(f'{\"Config\":<22} {\"Size MB\":>10} {\"Avg RTS\":>10} {\"Stdev\":>8} {\"Kept\":>6}')
+        print('-' * 58)
+        for config_id, size, avg, sd, kept, _ in results:
+            print(f'{config_id:<22} {size:>10.1f} {avg:>10.2f}x {sd:>7.2f} {kept:>4}/{RUNS}')
+        "
